@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Setup UPX
+        run: sudo apt-get update && sudo apt-get install -y upx
+
+      - name: Build C (static)
+        run: |
+          gcc -O2 -s -static -o doaswhat-c doaswhat.c
+          upx --best -o doaswhat-c.upx doaswhat-c
+          mv doaswhat-c.upx doaswhat-c
+
+      - name: Build Go
+        run: |
+          go build -ldflags="-s -w" -o doaswhat-go doaswhat.go
+          upx --best -o doaswhat-go.upx doaswhat-go
+          mv doaswhat-go.upx doaswhat-go
+
+      - name: Commit binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f doaswhat-c doaswhat-go
+          git diff --cached --quiet || {
+            git commit -m "build: update binaries"
+            git push
+          }

@@ -1,0 +1,274 @@
+#!/bin/bash
+
+# doaswhat v2.0 - Bash version
+# https://github.com/yanxinwu946/doaswhat
+
+readonly VERSION="v2.0"
+
+# Color setup
+setup_colors() {
+    if [[ -z "${NO_COLOR:-}" ]] && [[ "${CLICOLOR:-}" != "0" ]] && \
+       { [[ -n "${CLICOLOR_FORCE:-}" ]] || [[ -t 1 ]]; }; then
+        R='\033[31m'
+        G='\033[32m'
+        Y='\033[33m'
+        g='\033[90m'
+        w='\033[1m'
+        X='\033[0m'
+    else
+        R=''; G=''; Y=''; g=''; w=''; X=''
+    fi
+}
+
+# Banner
+banner() {
+    echo -e "doaswhat ${VERSION}  ${w}Sublarge${X}  ${g}https://github.com/yanxinwu946/doaswhat${X}"
+}
+
+# Show help
+show_help() {
+    banner
+    echo
+    echo "Usage: doaswhat [-u user] [-h]"
+    echo
+    echo "Enumerate doas permission rules by probing every"
+    echo "executable in \$PATH. Each command is tested twice -- by"
+    echo "full path and by basename -- to match both exact and"
+    echo "pattern-based rules in doas.conf."
+    echo
+    echo "Flags:"
+    echo "  -u user  test permissions for a given user (default: current user)"
+    echo "  -h       show this help"
+}
+
+# Get all executables in PATH
+get_executables() {
+    local -A seen
+    local exe_list=()
+    local IFS=':'
+
+    for d in $PATH; do
+        [[ -d "$d" ]] || continue
+        for e in "$d"/*; do
+            [[ -f "$e" ]] || continue
+            [[ -x "$e" ]] || continue
+            [[ -n "${seen["$e"]:-}" ]] && continue
+            seen["$e"]=1
+            exe_list+=("$e:$(basename "$e")")
+        done
+    done
+
+    printf '%s\n' "${exe_list[@]}"
+}
+
+# Read config file
+read_config() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    [[ -r "$file" ]] || return 1
+
+    local content
+    content=$(cat "$file" 2>/dev/null) || return 1
+    [[ -n "$content" ]] || return 1
+
+    echo "$content"
+}
+
+# Process a single config file
+process_config() {
+    local file="$1"
+    local content
+    content=$(read_config "$file") || return
+
+    echo -e "${G}[+]${X} ${file}"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        echo "    $line"
+    done <<< "$content"
+}
+
+main() {
+    local user=""
+    local show_help_flag=false
+
+    # Parse arguments
+    while getopts "u:h" opt; do
+        case $opt in
+            u) user="$OPTARG" ;;
+            h) show_help_flag=true ;;
+            *) show_help; exit 1 ;;
+        esac
+    done
+
+    setup_colors
+
+    if [[ "$show_help_flag" == true ]]; then
+        show_help
+        exit 0
+    fi
+
+    banner
+    echo
+
+    # Find doas
+    local doas_path
+    doas_path=$(command -v doas 2>/dev/null) || {
+        echo -e "${R}!${X} doas not found"
+        exit 1
+    }
+
+    echo -e "${w}[*]${X} binary"
+    ls -l "$doas_path" 2>/dev/null || echo "$doas_path"
+    echo
+
+    if [[ -n "$user" ]]; then
+        echo -e "${w}[*]${X} user"
+        echo "$user"
+        echo
+    fi
+
+    # Read config files
+    echo -e "${w}[*]${X} configs"
+    process_config "/etc/doas.conf"
+    process_config "/usr/local/etc/doas.conf"
+
+    # Process /etc/doas.d/
+    if [[ -d "/etc/doas.d" ]]; then
+        for conf in /etc/doas.d/*.conf; do
+            [[ -f "$conf" ]] && process_config "$conf"
+        done
+    fi
+
+    # Get executables
+    local -a exe_array
+    mapfile -t exe_array < <(get_executables)
+    local total_exe=${#exe_array[@]}
+    local total_tests=$((total_exe * 2))
+
+    echo
+    echo -e "${w}[*]${X} probing ${total_exe} commands..."
+
+    # Create temp directory
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf $tmpdir; stty echo 2>/dev/null" EXIT
+
+    # Store command info and launch tests
+    local doas_cmd="$doas_path"
+    [[ -n "$user" ]] && doas_cmd="$doas_cmd -u $user"
+
+    local cnt=0
+    for entry in "${exe_array[@]}"; do
+        local cmd="${entry%:*}"
+        local name="${entry#*:}"
+        local id=$(echo "$cmd" | cksum | cut -d' ' -f1)
+
+        echo "$cmd" > "$tmpdir/cmd_$id"
+        echo "$name" > "$tmpdir/name_$id"
+
+        # Test full path - completely detached from terminal
+        (
+            exec </dev/null >/dev/null 2>&1
+            $doas_cmd "$cmd" --help
+            echo $? > "$tmpdir/exit_full_$id"
+        ) &
+        echo $! > "$tmpdir/pid_full_$id"
+
+        # Test basename - completely detached from terminal
+        (
+            exec </dev/null >/dev/null 2>&1
+            $doas_cmd "$name" --help
+            echo $? > "$tmpdir/exit_name_$id"
+        ) &
+        echo $! > "$tmpdir/pid_name_$id"
+
+        cnt=$((cnt + 1))
+        printf "\r${g}[%d/%d]${X} testing..." "$cnt" "$total_exe"
+    done
+    echo
+
+    echo -e "${w}[*]${X} analyzing results..."
+
+    # Collect results
+    local -A seen
+    local -a nopass_cmds=()
+    local -a pass_cmds=()
+
+    for pidf in "$tmpdir"/pid_full_*; do
+        [[ -f "$pidf" ]] || continue
+
+        local id=$(basename "$pidf" | sed 's/pid_full_//')
+        local pid=$(cat "$pidf" 2>/dev/null)
+        local cmd=$(cat "$tmpdir/cmd_$id" 2>/dev/null)
+        local name=$(cat "$tmpdir/name_$id" 2>/dev/null)
+        [[ -z "$cmd" ]] && continue
+
+        # Check full path result
+        local full_result="none"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            full_result="pass"
+        else
+            local exitcode=$(cat "$tmpdir/exit_full_$id" 2>/dev/null || echo "1")
+            [[ "$exitcode" == "0" ]] && full_result="nopass"
+        fi
+
+        # Check basename result
+        local name_result="none"
+        local pid_name=$(cat "$tmpdir/pid_name_$id" 2>/dev/null)
+        if kill -0 "$pid_name" 2>/dev/null; then
+            kill "$pid_name" 2>/dev/null
+            name_result="pass"
+        else
+            local exitcode=$(cat "$tmpdir/exit_name_$id" 2>/dev/null || echo "1")
+            [[ "$exitcode" == "0" ]] && name_result="nopass"
+        fi
+
+        if [[ "$full_result" != "none" ]] && [[ -z "${seen["$cmd"]:-}" ]]; then
+            seen["$cmd"]=1
+            if [[ "$full_result" == "nopass" ]]; then
+                nopass_cmds+=("$cmd")
+            else
+                pass_cmds+=("$cmd")
+            fi
+        fi
+
+        if [[ "$name_result" != "none" ]] && [[ -z "${seen["$name"]:-}" ]]; then
+            seen["$name"]=1
+            if [[ "$name_result" == "nopass" ]]; then
+                nopass_cmds+=("$name")
+            else
+                pass_cmds+=("$name")
+            fi
+        fi
+    done
+
+    if [[ ${#nopass_cmds[@]} -eq 0 ]] && [[ ${#pass_cmds[@]} -eq 0 ]]; then
+        echo -e "${R}!${X} no commands allowed via doas"
+        exit 0
+    fi
+
+    local prefix="doas"
+    [[ -n "$user" ]] && prefix="doas -u $user"
+
+    if [[ ${#nopass_cmds[@]} -gt 0 ]]; then
+        echo
+        echo -e "${G}[+]${X} you can run these without a password:"
+        for cmd in "${nopass_cmds[@]}"; do
+            echo "    $prefix $cmd"
+        done
+    fi
+
+    if [[ ${#pass_cmds[@]} -gt 0 ]]; then
+        echo
+        echo -e "${Y}[!]${X} these require a password:"
+        for cmd in "${pass_cmds[@]}"; do
+            echo "    $prefix $cmd"
+        done
+    fi
+
+    echo
+    stty echo 2>/dev/null
+}
+
+main "$@"
